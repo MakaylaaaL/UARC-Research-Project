@@ -21,7 +21,7 @@ document_embeddings = TransformerDocumentEmbeddings('bert-base-uncased')
 
 # Generate document embedding function
 def embed_text(text):
-    sentence = Sentence(text)
+    sentence = Sentence(text) 
     document_embeddings.embed(sentence)
     return sentence.embedding.detach().cpu().numpy()  # Ensure it's moved to CPU and converted to NumPy array
 
@@ -30,9 +30,9 @@ report_vectors = []
 for report in sample_reports:
     vector = embed_text(report)
     report_vectors.append(vector)
-    print(f"Processed report: {report}")
+    print(f"Processed report: {report}\n")  # Adding a newline for better readability
 
 # Print the resulting vectors (for demonstration)
 print("\nDocument Embeddings (Vectors):")
 for i, vector in enumerate(report_vectors):
-    print(f"Report {i + 1} vector:\n", vector)
+    print(f"Report {i + 1} vector (shape {vector.shape}):\n", vector, "\n")  # Show vector shape for clarity
