@@ -1,38 +1,1116 @@
+import os
+import re
 import numpy as np
-from flair.embeddings import TransformerDocumentEmbeddings 
+import pdfplumber
+import fitz
+import umap
+import plotly.express as px
+import pandas as pd
+import joblib
+import hdbscan
+import plotly.graph_objs as go
+import plotly.io as pio
+import warnings
+import logging
+import helpers
+import seaborn as sns
+import matplotlib.pyplot as plt 
+from helpers import plot_topN_heatmap
+from tqdm.notebook import tqdm
+from flair.embeddings import TransformerDocumentEmbeddings
 from flair.data import Sentence
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder, MinMaxScaler
+from collections import Counter
+from collections import defaultdict
+from sklearn.metrics import silhouette_score
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
 
-# Simulation extracted reports (Sample text data)
-sample_reports = [
-    "the pilot departed on the agricultural application flight with full fuel tanks and 105 gallons of spray",
-    "mixture onboard which he stated was a lighter load than the previous day he described the airplane",
-    "climb as shallow and stated that as the airplane neared the end of the runway it began to descend",
-    "the left main landing gear impacted a power line and the airplane subsequently descended into terrain",
-    "resulting in substantial damage to the wings and fuselage",
-    "postaccident examination of the engine revealed no preimpact mechanical malfunction or failure that",
-    "would have precluded normal operation",
-    "a breathalyzer test performed about 45 minutes after the accident revealed that the pilot's blood alcohol",
-    "content was at the time of the accident the pilot's blood alcohol content was likely to",
-    "which would have been impairing"
-]
 
-# Initialize BERT embeddings
+pio.renderers.default = "notebook_connected"
+# Suppress all warnings from pdfplumber and pdfminer
+warnings.filterwarnings("ignore", category=UserWarning, module="pdfplumber")
+warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
+
+# Suppress logging output from pdfminer
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+
+# 1. Load PDFs
+pdf_folder = "/Users/makayla/Downloads/NTSB-BH"
+pdf_files  = [os.path.join(pdf_folder, f) for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
+
+# 2. Embedding setup
 document_embeddings = TransformerDocumentEmbeddings('bert-base-uncased')
 
-# Generate document embedding function
-def embed_text(text):
-    sentence = Sentence(text) 
-    document_embeddings.embed(sentence)
-    return sentence.embedding.detach().cpu().numpy()  # Ensure it's moved to CPU and converted to NumPy array
+def embed_text(text: str) -> np.ndarray:
+    sent = Sentence(text[:2000])
+    document_embeddings.embed(sent)
+    return sent.embedding.detach().cpu().numpy()
 
-# Generate embeddings for each sample report
-report_vectors = []
-for report in sample_reports:
-    vector = embed_text(report)
-    report_vectors.append(vector)
-    print(f"Processed report: {report}\n")  # Adding a newline for better readability
+# 3. Simplifiers
+def simplify_def_event(txt: str) -> str:
+    return re.split(r"[\/,\"]", txt)[0].title().strip() or "Unknown"
 
-# Print the resulting vectors (for demonstration)
-print("\nDocument Embeddings (Vectors):")
-for i, vector in enumerate(report_vectors):
-    print(f"Report {i + 1} vector (shape {vector.shape}):\n", vector, "\n")  # Show vector shape for clarity
+def simplify_flight_type(txt: str) -> str:
+    txt = txt.lower()
+    if "91" in txt: return "General Aviation"
+    if "135" in txt: return "Air Taxi/Charter"
+    if "121" in txt: return "Commercial Airline"
+    if "public" in txt: return "Public Use"
+    if "instruction" in txt: return "Instructional"
+    if "military" in txt: return "Military"
+    return "Other"
+
+# 4. Defining Event bucketing
+def bucket_def_event(event_raw: str) -> str:
+    e = event_raw.lower()
+    if re.search(r"controlled flight into terr", e) or "cfit" in e:
+        return "Controlled Flight into Terrain"
+    if "flight control" in e:
+        return "Flight Control Failure"
+    if "bird" in e or "wildlife" in e:
+        return "Bird/Wildlife"
+    if "collision" in e:
+        return "Collision"
+    if "engine" in e or "power" in e:
+        return "Engine/Power"
+    if "fuel" in e:
+        return "Fuel"
+    if "loss of control" in e:
+        return "Loss of Control"
+    if "medical" in e or "pilot incapacitation" in e:
+        return "Medical/Pilot"
+    if "runway" in e:
+        return "Runway"
+    if "ground" in e or "vehicle" in e:
+        return "Ground/Structural"
+    if "maintenance" in e or "structural" in e:
+        return "Structural/Maint"
+    if "system" in e or "malfunction" in e:
+        return "System Malfunction"
+    if "weather" in e or "turbulence" in e:
+        return "Weather/Turbulence"
+    if "unknown" in e or not e.strip():
+        return "Unknown"
+    return "Other"
+
+# 5. Color Maps for Consistent Legends 
+color_map_flight = {
+    'General Aviation': 'blue',
+    'Air Taxi/Charter': 'orange',
+    'Commercial Airline': 'green',
+    'Public Use': 'red',
+    'Instructional': 'purple',
+    'Military': 'brown',
+    'Other': 'gray'
+}
+
+color_map_event = {
+    'Bird/Wildlife': 'blue',
+    'Collision': 'red',
+    'Engine/Power': 'orange',
+    'Fuel': 'purple',
+    'Loss of Control': 'green',
+    'Controlled Flight into Terrain': 'magenta',
+    'Flight Control Failure': 'darkred',
+    'Medical/Pilot': 'pink',
+    'Runway': 'brown',
+    'Ground/Structural': 'gray',
+    'Structural/Maint': 'teal',
+    'System Malfunction': 'yellow',
+    'Weather/Turbulence': 'cyan',
+    'Unknown': 'black',
+    'Other': 'lightgray'
+}
+
+
+
+color_map_injury = {
+    'Fatal': 'red',
+    'Serious': 'orange',
+    'Minor': 'yellow',
+    'None': 'green',
+    'Unknown': 'gray'
+}
+
+# 6. Extractor
+def extract_sections(pdf_path):
+    meta_raw = {
+        "Defining Event": "Unknown",
+        "Flight Conducted Under": "Unknown",
+        "Injuries": "0 0 0 0 0",  # Serious Fatal Minor None Unknown
+        "Location": "Unknown",
+        "Date & Time": "Unknown",
+        "Registration": "Unknown",
+        "Aircraft": "Unknown",
+        "Aircraft Damage": "Unknown"
+    }
+
+    analysis_lines, prob_lines = [], []
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            lines = []
+            for p in pdf.pages[:2]:
+                txt = p.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                lines.extend(txt.splitlines())
+
+        # Parse metadata
+        for ln in lines:
+            l = ln.lower()
+
+            if "defining event:" in l:
+                match = re.search(r"defining event:\s*([^\n:]+)", ln, flags=re.IGNORECASE)
+                if match:
+                    meta_raw["Defining Event"] = match.group(1).strip()
+            if l.startswith("flight conducted under:"):
+                meta_raw["Flight Conducted Under"] = ln.split(":", 1)[1].strip()
+            if l.startswith("location:"):
+                meta_raw["Location"] = ln.split(":", 1)[1].strip()
+            elif l.startswith("date & time:"):
+                meta_raw["Date & Time"] = ln.split(":", 1)[1].strip()
+            elif l.startswith("registration:"):
+                meta_raw["Registration"] = ln.split(":", 1)[1].strip()
+            elif l.startswith("aircraft:"):
+                meta_raw["Aircraft"] = ln.split(":", 1)[1].strip()
+            elif l.startswith("aircraft damage:"):
+                meta_raw["Aircraft Damage"] = ln.split(":", 1)[1].strip()
+
+        # Robust injury parsing (supports multi-line, multiple aircraft)
+        fatal = serious = minor = none = unknown = 0
+        i = 0
+        while i < len(lines):
+            l = lines[i].lower()
+
+            if "injuries" in l:
+                # Combine with next line just in case
+                combined = lines[i]
+                if i + 1 < len(lines):
+                    combined += " " + lines[i + 1]
+
+                # Extract all injury patterns: 1 Fatal, 2 Serious, etc.
+                matches = re.findall(
+                    r"(\d+)\s*(?:\([^)]+\))?\s*(fatal|serious|minor|none|unknown)",
+                    combined,
+                    flags=re.IGNORECASE
+                )
+
+                for num_str, category in matches:
+                    num = int(num_str)
+                    category = category.lower()
+                    if "fatal" in category: fatal += num
+                    elif "serious" in category: serious += num
+                    elif "minor" in category: minor += num
+                    elif "none" in category: none += num
+                    elif "unknown" in category: unknown += num
+
+                i += 2  # Skip next line
+            else:
+                i += 1
+
+        meta_raw["Injuries"] = f"{serious} {fatal} {minor} {none} {unknown}"
+
+        # Analysis / Probable Cause
+        in_analysis = in_prob = False
+        for ln in lines:
+            low = ln.lower()
+            if low.startswith("analysis"):
+                in_analysis, in_prob = True, False
+                continue
+            if low.startswith("probable cause"):
+                in_analysis, in_prob = False, True
+                continue
+            if any(k in low for k in ("findings", "history of flight")):
+                in_analysis = in_prob = False
+
+            if in_analysis:
+                analysis_lines.append(ln.strip())
+            elif in_prob:
+                prob_lines.append(ln.strip())
+
+    except Exception as e:
+        print(f"[extract_sections] {os.path.basename(pdf_path)} → {e}")
+
+    clean_meta = {
+        "Defining Event": simplify_def_event(meta_raw["Defining Event"]),
+        "Flight Conducted Under": simplify_flight_type(meta_raw["Flight Conducted Under"]),
+        "Injuries": meta_raw["Injuries"],
+        "Location": meta_raw["Location"],
+        "Date & Time": meta_raw["Date & Time"],
+        "Registration": meta_raw["Registration"],
+        "Aircraft": meta_raw["Aircraft"],
+        "Aircraft Damage": meta_raw["Aircraft Damage"]
+    }
+
+    core_text = "\n".join(analysis_lines).strip()
+    if prob_lines:
+        core_text += "\n\n--- PROBABLE CAUSE ---\n\n" + "\n".join(prob_lines).strip()
+
+    clean_meta["Parse Confidence"] = "Low" if len(core_text.split()) < 20 else "High"
+
+    return clean_meta, core_text
+
+# 7. Process PDFs
+def process_pdfs(pdf_paths):
+    print(" Starting PDF processing...")
+    embeddings, metadata_list, filenames = [], [], []
+    ok = bad = 0
+
+    for i, path in enumerate(tqdm(pdf_paths, desc="Embedding")):
+        try:
+            meta, text = extract_sections(path)
+
+            if len(text.split()) < 20:
+                with fitz.open(path) as doc:
+                    text = " ".join(p.get_text() for p in doc)
+
+            if len(text.split()) < 20:
+                raise ValueError("No usable text")
+
+            embeddings.append(embed_text(text))
+            metadata_list.append((meta, text))
+            filenames.append(os.path.basename(path))
+            ok += 1
+        except Exception as e:
+            print(f"Skip {os.path.basename(path)} → {e}")
+            bad += 1
+        if (i+1) % 100 == 0:
+            print(f"  processed {i+1} files…")
+
+    print(f"\nSummary:  {ok} embedded   {bad} failed")
+    return filenames, embeddings, metadata_list
+
+# Check if cached embeddings exist
+if os.path.exists("embedding_cache.pkl"):
+    print("Loading cached embeddings...")
+    filenames, vectors, meta = joblib.load("embedding_cache.pkl")  # <- FIXED: include filenames
+else:
+    filenames, vectors, meta = process_pdfs(pdf_files)
+    joblib.dump((filenames, vectors, meta), "embedding_cache.pkl")
+    print(" Saved new embeddings to cache.")
+
+
+print("Number of vectors:", len(vectors))
+if vectors:
+    print("First vector shape:", vectors[0].shape)
+vec_array = np.vstack(vectors)
+print("Vector array shape:", vec_array.shape)
+
+# Reduce text embeddings before combining
+max_components = min(100, vec_array.shape[0], vec_array.shape[1])
+pca_text = PCA(n_components=max_components, random_state=42)
+vec_reduced = pca_text.fit_transform(vec_array)
+print("Reduced text embedding shape:", vec_reduced.shape)
+
+
+# Distribution check
+flight_types = [m[0]["Flight Conducted Under"] for m in meta]
+flight_counts = Counter(flight_types)
+print("\nFlight Conducted Under Distribution:")
+for label, count in flight_counts.items():
+    print(f"  {label:20}: {count}")
+
+# 8. Dataframe
+df = pd.DataFrame([m[0] for m in meta])
+print(df["Parse Confidence"].value_counts())
+
+# Add filename column and accident number
+df["Filename"] = filenames
+df = df.reset_index().rename(columns={"index": "Accident Number"})
+df["Narrative"] = [m[1] for m in meta]   # this stores the analysis/probable cause text
+# Build lookup from your main dataframe
+text_lookup = dict(zip(df['Filename'], df['Narrative']))
+
+
+# Handle datetime
+df["Date & Time"] = pd.to_datetime(df["Date & Time"], errors="coerce")
+df["Year"] = df["Date & Time"].dt.year.fillna(0).astype(int)
+df["Month"] = df["Date & Time"].dt.month.fillna(0).astype(int)
+df["Hour"] = df["Date & Time"].dt.hour.fillna(0).astype(int)
+
+# Ensure Injuries column exists and is valid
+if "Injuries" not in df.columns:
+    df["Injuries"] = "0 0 0 0 0"
+
+df["Injuries"] = df["Injuries"].fillna("0 0 0 0 0")
+df["Injuries"] = df["Injuries"].apply(lambda x: " ".join((str(x).split() + ["0"] * 5)[:5]))
+
+#Drop Registration if unused
+if 'Registration' in df.columns:
+    df = df.drop(columns=['Registration'])
+
+# Expand into 5 numeric columns
+inj_split = df["Injuries"].str.split(" ", expand=True).fillna(0).astype(int)
+df["Serious Injuries"] = inj_split[0]
+df["Fatal Injuries"]   = inj_split[1]
+df["Minor Injuries"]   = inj_split[2]
+df["No Injuries"]      = inj_split[3]
+df["Unknown Injuries"] = inj_split[4]
+
+# --- Classify injury severity ---
+def classify_injury_row(row):
+    if row["Fatal Injuries"] > 0:
+        return "Fatal"
+    elif row["Serious Injuries"] > 0:
+        return "Serious"
+    elif row["Minor Injuries"] > 0:
+        if row["No Injuries"] > 0:
+            print(f"[WARNING] Conflicting injuries in row with both Minor and None: {row['Filename']}")
+        return "Minor"
+    elif row["No Injuries"] > 0:
+        return "None"
+    else:
+        return "Unknown"
+
+df["Injury Label"] = df.apply(classify_injury_row, axis=1)
+
+# Readable list of all injury types
+def injury_types_list(row):
+    types = []
+    if row["Fatal Injuries"] > 0: types.append("Fatal")
+    if row["Serious Injuries"] > 0: types.append("Serious")
+    if row["Minor Injuries"] > 0: types.append("Minor")
+    if row["No Injuries"] > 0: types.append("None")
+    if row["Unknown Injuries"] > 0: types.append("Unknown")
+    return ", ".join(types)
+
+df["Injury Types"] = df.apply(injury_types_list, axis=1)
+
+# 9. Label Encoding
+enc_path = "label_encoders.pkl"
+
+# Helper: ensure column values are strings and fill missing with "Unknown"
+def clean_col(series):
+    return series.fillna("Unknown").astype(str)
+
+if os.path.exists(enc_path):
+    # Load previously saved encoders (keeps mappings stable across runs)
+    label_encoders = joblib.load(enc_path)
+    event_le    = label_encoders["Defining Event"]
+    flight_le   = label_encoders["Flight Conducted Under"]
+    injury_le   = label_encoders["Injury Label"]
+    location_le = label_encoders["Location"]
+    aircraft_le = label_encoders["Aircraft"]
+    damage_le   = label_encoders["Aircraft Damage"]
+    print(f"Loaded label encoders from {enc_path}")
+else:
+    # Fit new encoders and save them
+    event_le    = LabelEncoder().fit(clean_col(df["Defining Event"]))
+    flight_le   = LabelEncoder().fit(clean_col(df["Flight Conducted Under"]))
+    injury_le   = LabelEncoder().fit(clean_col(df["Injury Label"]))
+    location_le = LabelEncoder().fit(clean_col(df["Location"]))
+    aircraft_le = LabelEncoder().fit(clean_col(df["Aircraft"]))
+    damage_le   = LabelEncoder().fit(clean_col(df["Aircraft Damage"]))
+
+    label_encoders = {
+        "Defining Event": event_le,
+        "Flight Conducted Under": flight_le,
+        "Injury Label": injury_le,
+        "Location": location_le,
+        "Aircraft": aircraft_le,
+        "Aircraft Damage": damage_le
+    }
+    joblib.dump(label_encoders, enc_path)
+    print(f"Fitted and saved label encoders to {enc_path}")
+
+# Safe transform: map unseen values to "Unknown" if encoder has that class
+def safe_transform(le, series):
+    s = clean_col(series)
+    # if there are values not seen by encoder, map to "Unknown" when possible
+    unseen = set(s.unique()) - set(le.classes_)
+    if unseen:
+        if "Unknown" in le.classes_:
+            s = s.apply(lambda x: x if x in le.classes_ else "Unknown")
+        else:
+            # fallback: convert unseen to a most frequent class (or raise)
+            # here we map unseen to the first existing class to avoid crash
+            s = s.apply(lambda x: x if x in le.classes_ else le.classes_[0])
+    return le.transform(s).reshape(-1, 1)
+
+# Now create encoded arrays (these replace your old `*_encoded` variables)
+event_encoded    = safe_transform(event_le, df["Defining Event"])
+flight_encoded   = safe_transform(flight_le, df["Flight Conducted Under"])
+location_encoded = safe_transform(location_le, df["Location"])
+aircraft_encoded = safe_transform(aircraft_le, df["Aircraft"])
+damage_encoded   = safe_transform(damage_le, df["Aircraft Damage"])
+injury_encoded   = safe_transform(injury_le, df["Injury Label"])  
+
+
+# Numeric injury vector 
+injury_vector = df[[
+    "Serious Injuries",
+    "Fatal Injuries",
+    "Minor Injuries",
+    "No Injuries",
+    "Unknown Injuries"
+]].values
+
+# Combine numeric + categorical metadata 
+metadata_combined = np.hstack([injury_vector,        
+    event_encoded,      
+    flight_encoded,       
+    location_encoded,      
+    aircraft_encoded,      
+    damage_encoded,        
+    df[["Year", "Month", "Hour"]].values])
+
+metadata_combined = StandardScaler().fit_transform(metadata_combined)
+
+# Combine reduced embeddings with scaled metadata
+full_combined_vector = np.hstack([vec_reduced, metadata_combined])
+print("Combined vector shape:", full_combined_vector.shape)
+df["Embedding"] = list(full_combined_vector)
+
+# 10. UMAP
+scaler = StandardScaler()
+vec_scaled = scaler.fit_transform(vec_array)
+
+# Encode Defining Events
+def_labels_raw = [bucket_def_event(m[0]["Defining Event"]) for m in meta]
+def_event_le = LabelEncoder().fit(def_labels_raw)
+y_int = def_event_le.transform(def_labels_raw)
+
+# Prepare Flight Conducted Under labels and encode
+flight_types_raw = [m[0]["Flight Conducted Under"] for m in meta]
+flight_le = LabelEncoder()
+flight_le.fit(flight_types_raw)
+flight_y = flight_le.transform(flight_types_raw)
+
+# Supervised UMAP using Defining Event
+umap_def_event = umap.UMAP(
+    n_components=3,
+    n_neighbors=100,
+    n_epochs=1000,
+    min_dist=0.5,
+    local_connectivity=2,
+    metric="cosine",
+    random_state=42,
+    target_metric="categorical"
+)
+embedding_def_event = umap_def_event.fit_transform(full_combined_vector, y=y_int)
+
+# Supervised UMAP using Flight Conducted Under
+umap_flight_type = umap.UMAP(
+    n_components=3,
+    n_neighbors=100,
+    n_epochs=1000,
+    min_dist=0.5,
+    local_connectivity=2,
+    metric="cosine",
+    random_state=42,
+    target_metric="categorical"
+)
+embedding_flight_type = umap_flight_type.fit_transform(full_combined_vector, y=flight_y)
+
+# Supervised UMAP using full 5D injury vector
+injury_matrix = df[[
+    "Serious Injuries",
+    "Fatal Injuries",
+    "Minor Injuries",
+    "No Injuries",
+    "Unknown Injuries"
+]].values
+
+umap_injury_vector = umap.UMAP(
+    n_components=3,
+    n_neighbors=100,
+    n_epochs=1000,
+    min_dist=0.5,
+    local_connectivity=2,
+    metric="cosine",
+    random_state=42,
+    target_metric="l2"
+)
+embedding_injury_vector = umap_injury_vector.fit_transform(full_combined_vector, y=injury_matrix)
+
+# UMAP on combined embeddings (text + metadata)
+combined_umap = umap.UMAP(
+    n_components=3,
+    n_neighbors=100,
+    min_dist=0.5,
+    metric="cosine",
+    random_state=42
+)
+
+embedding_combined = combined_umap.fit_transform(full_combined_vector)
+print("UMAP combined embedding shape:", embedding_combined.shape)
+
+umap_results = umap.UMAP(
+    n_neighbors=15, 
+    min_dist=0.1, 
+    random_state=42
+).fit_transform(embedding_combined)
+
+umap_model = umap.UMAP(n_components=3, random_state=42)
+umap_results = umap_model.fit_transform(embedding_combined)
+
+df['UMAP1'] = umap_results[:, 0]
+df['UMAP2'] = umap_results[:, 1]
+df['UMAP3'] = umap_results[:, 2]
+
+df = helpers.cluster_umap(df)   # uses UMAP1,2,3
+helpers.cluster_sizes(df)
+
+#  Create separate DataFrames for each topic
+df_defining_event = df[['Filename', 'Embedding', 'Defining Event']].copy()
+df_flight_conducted = df[['Filename', 'Embedding', 'Flight Conducted Under']].copy()
+df_injuries = df[['Filename', 'Embedding', 'Serious Injuries', 'Fatal Injuries', 'Minor Injuries', 'No Injuries', 'Unknown Injuries']].copy()
+
+df_defining_event['Embedding'] = list(embedding_def_event)
+df_flight_conducted['Embedding'] = list(embedding_flight_type)
+df_injuries['Embedding'] = list(embedding_injury_vector)
+
+# --- Defining Event ---
+df_defining_event = df[['Filename', 'Embedding', 'Defining Event', 'Narrative']].copy()
+df_defining_event['Embedding'] = list(embedding_def_event)
+df_defining_event[['UMAP1','UMAP2','UMAP3']] = embedding_def_event  # already 3D
+
+# --- Flight Conducted Under ---
+df_flight_conducted = df[['Filename', 'Embedding', 'Flight Conducted Under','Narrative']].copy()
+df_flight_conducted['Embedding'] = list(embedding_flight_type)
+df_flight_conducted[['UMAP1','UMAP2','UMAP3']] = embedding_flight_type  # already 3D
+
+# --- Injuries ---
+df_injuries = df[['Filename', 'Embedding', 'Serious Injuries', 'Fatal Injuries',
+                  'Minor Injuries', 'No Injuries', 'Unknown Injuries','Narrative']].copy()
+df_injuries['Embedding'] = list(embedding_injury_vector)
+df_injuries[['UMAP1','UMAP2','UMAP3']] = embedding_injury_vector  # already 3D
+
+# Run keyword inspection for each space
+helpers.analyze_keywords(df_defining_event, label="Defining Event UMAP")
+helpers.analyze_keywords(df_flight_conducted, label="Flight Conducted UMAP")
+helpers.analyze_keywords(df_injuries, label="Injuries UMAP")
+
+df_defining_event = helpers.cluster_umap(df_defining_event)
+df_flight_conducted = helpers.cluster_umap(df_flight_conducted)
+df_injuries = helpers.cluster_umap(df_injuries)
+
+# Choose HDBSCAN params (tune min_cluster_size/min_samples to taste)
+hdb_min_size = 10
+hdb_min_samples = 5
+
+# RUN & ASSIGN for Defining Event
+df_defining_event, hdb_def, labels_def = helpers.run_hdbscan_assign(
+    df_defining_event, embedding_def_event,
+    cluster_col="Cluster",
+    min_cluster_size=hdb_min_size,
+    min_samples=hdb_min_samples
+)
+
+# RUN & ASSIGN for Flight Conducted Under
+df_flight_conducted, hdb_flight, labels_flight = helpers.run_hdbscan_assign(
+    df_flight_conducted, embedding_flight_type,
+    cluster_col="Cluster",
+    min_cluster_size=hdb_min_size,
+    min_samples=hdb_min_samples
+)
+
+# RUN & ASSIGN for Injuries
+df_injuries, hdb_injury, labels_injury = helpers.run_hdbscan_assign(
+    df_injuries, embedding_injury_vector,
+    cluster_col="Cluster",
+    min_cluster_size=hdb_min_size,
+    min_samples=hdb_min_samples
+)
+
+# Collapse multiple injury columns into one label for keyword analysis
+def collapse_injuries(df):
+    def pick_injury(row):
+        for col in ["Fatal Injuries", "Serious Injuries", "Minor Injuries", "No Injuries", "Unknown Injuries"]:
+            if row[col] not in [None, 0, "0", ""]:
+                return col
+        return "Unknown"
+    
+    df["Injuries"] = df.apply(pick_injury, axis=1)
+    return df
+
+# Apply it
+df_injuries = collapse_injuries(df_injuries)
+
+injury_split = df["Injuries"].str.split(" ", expand=True)
+injury_split.columns = ["Fatal", "Serious", "Minor", "None", "Unknown"]
+
+# Convert to numeric
+for col in injury_split.columns:
+    injury_split[col] = pd.to_numeric(injury_split[col], errors="coerce")
+
+# Add back into df
+df = pd.concat([df, injury_split], axis=1)
+
+
+# 11. Plot
+def plot_events(embedding, labels, title, label_encoder, color_map, df, hover_text=None):
+    label_names = [label_encoder.classes_[i] for i in labels]
+    num_data = len(embedding)
+
+    fig = px.scatter_3d(
+        x=embedding[:, 0],
+        y=embedding[:, 1],
+        z=embedding[:, 2],
+        color=label_names,
+        hover_name=None,  
+        hover_data=None,  
+        custom_data=[hover_text], 
+        color_discrete_map=color_map,
+        title=f'{title} (with {len(embedding)} reports)',
+        labels={"color": "Category"},
+        opacity=0.7
+    )
+    fig.update_traces(
+    marker=dict(size=4),
+    hovertemplate="%{customdata[0]}<extra></extra>"
+    )
+
+    # Define range for camera controls
+    slider_steps_x = [
+        dict(method='relayout',
+              label=f'{x:.1f}',
+              args=[{'scene.camera.eye.x': x}]) 
+        for x in np.linspace(0.1, 2.5, 21)
+    ]
+
+    slider_steps_y = [
+        dict(method='relayout',
+              label=f'{y:.1f}',
+              args=[{'scene.camera.eye.y': y}]) 
+        for y in np.linspace(0.5, 2.5, 21)
+    ]
+
+    # Here we zoom in much further by extending range down to 0.1
+    slider_steps_z = [
+        dict(method='relayout',
+              label=f'{z:.2f}',
+              args=[{'scene.camera.eye.z': z}]) 
+        for z in np.linspace(2.5, 0.1, 25)
+    ]
+
+    # Combine into separate sliders
+    sliders = [
+    dict(
+        active=10,
+        currentvalue=dict(prefix='Eye.x: '),
+        pad={"t": 50},
+        len=0.3,
+        x=0.1,  # starting x position
+        y=0.1,  # starting y position
+        steps=slider_steps_x,
+    ),
+    dict(
+        active=10,
+        currentvalue=dict(prefix='Eye.y: '),
+        pad={"t": 50},
+        len=0.3,
+        x=0.5,  # move this to the right side
+        y=0.1,
+        steps=slider_steps_y,
+    ),
+    dict(
+        active=10,
+        currentvalue=dict(prefix='Eye.z: '),
+        pad={"t": 50},
+        len=0.3,
+        x=0.9,  # further to the right
+        y=0.1,
+        steps=slider_steps_z,
+    )
+]
+    fig.update_layout(
+    sliders=sliders,
+    width=1000,   # Or whatever size you prefer
+    height=800,   # Increase height for space under the plot
+    margin=dict(l=50, r=50, t=50, b=120)  # Bottom margin for sliders
+)
+    fig.show()
+
+umap_hover_text = [
+    f"{df.iloc[i]['Filename']}<br>"
+    f"Defining Event: {df.iloc[i]['Defining Event']}<br>"
+    f"Flight Type: {df.iloc[i]['Flight Conducted Under']}<br>"
+    f"Injuries: {df.iloc[i]['Injury Types']}<br>"
+    f"Confidence: {df.iloc[i]['Parse Confidence']}"
+    for i in range(len(embedding_def_event))  # safer
+]
+
+print(" Plotting for Supervised UMAP...")
+plot_events(embedding_def_event, y_int, "UMAP by Defining Event", def_event_le, color_map_event, df, hover_text=umap_hover_text)
+plot_events(embedding_flight_type, flight_y, "UMAP by Flight Conducted Under", flight_le, color_map_flight, df, hover_text=umap_hover_text)
+
+# Dominant injury label for plotting
+
+def get_dominant_injury(row):
+    categories = ["Serious", "Fatal", "Minor", "None", "Unknown"]
+    values = [row["Serious Injuries"], row["Fatal Injuries"], row["Minor Injuries"],
+              row["No Injuries"], row["Unknown Injuries"]]
+    return categories[np.argmax(values)]
+
+df["Dominant Injury"] = df.apply(get_dominant_injury, axis=1)
+
+injury_le_vector = LabelEncoder()
+injury_y_vector = injury_le_vector.fit_transform(df["Dominant Injury"])
+
+# Plot with full injury vector
+plot_events(embedding_injury_vector, injury_y_vector, "UMAP by Injury Vector", injury_le_vector, color_map_injury, df, hover_text=umap_hover_text)
+
+def plot_hdbscan_with_labels(embedding, hdb_labels, true_labels, label_encoder, title, color_map, df):
+    x, y, z = embedding[:, 0], embedding[:, 1], embedding[:, 2]
+
+    fig = go.Figure()
+    unique_clusters = sorted(set(hdb_labels))
+
+    for cluster in unique_clusters:
+        indices = np.where(hdb_labels == cluster)[0]
+        cluster_label = "Noise" if cluster == -1 else f"{cluster}"
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=x[indices],
+                y=y[indices],
+                z=z[indices],
+                mode='markers',
+                marker=dict(
+                    size=5,
+                    color=cluster,
+                    colorscale='Viridis',
+                    opacity=0.8
+                ),
+                name=cluster_label,
+                hovertext=[
+                    f"File: {df.iloc[i]['Filename']}<br>"
+                    f"Event: {df.iloc[i]['Defining Event']}<br>"
+                    f"Flight Type: {df.iloc[i]['Flight Conducted Under']}<br>"
+                    f"Injuries: {df.iloc[i]['Injury Types']}<br>"
+                    f"Cluster: {cluster_label}"
+                    for i in indices
+                ],
+                hoverinfo="text"
+            )
+        )
+    # Sliders
+    slider_steps_x = [
+        dict(method='relayout', label=f'{x:.1f}', args=[{'scene.camera.eye.x': x}])
+        for x in np.linspace(0.1, 2.5, 21)
+    ]
+    slider_steps_y = [
+        dict(method='relayout', label=f'{y:.1f}', args=[{'scene.camera.eye.y': y}])
+        for y in np.linspace(0.5, 2.5, 21)
+    ]
+    slider_steps_z = [
+        dict(method='relayout', label=f'{z:.2f}', args=[{'scene.camera.eye.z': z}])
+        for z in np.linspace(2.5, 0.1, 25)
+    ]
+
+    sliders = [
+        dict(
+            active=10,
+            currentvalue=dict(prefix='Eye.x: '),
+            pad={"t": 50},
+            len=0.3,
+            x=0.1,
+            y=0.1,
+            steps=slider_steps_x,
+        ),
+        dict(
+            active=10,
+            currentvalue=dict(prefix='Eye.y: '),
+            pad={"t": 50},
+            len=0.3,
+            x=0.5,
+            y=0.1,
+            steps=slider_steps_y,
+        ),
+        dict(
+            active=10,
+            currentvalue=dict(prefix='Eye.z: '),
+            pad={"t": 50},
+            len=0.3,
+            x=0.9,
+            y=0.1,
+            steps=slider_steps_z,
+        )
+    ]
+
+    fig.update_layout(
+        title=title,
+        sliders=sliders,
+        width=1000,
+        height=800,
+        margin=dict(l=50, r=50, t=50, b=120),
+        scene=dict(
+            xaxis_title='x',
+            yaxis_title='y',
+            zaxis_title='z'
+        ),
+        legend_title="Cluster"
+    )
+
+    fig.show()
+
+def print_cluster_summary(hdb_labels, true_labels, label_encoder, title=""):
+    cluster_map = defaultdict(list)
+
+    for cl, true in zip(hdb_labels, true_labels):
+        cluster_map[cl].append(true)
+
+    print(f"\nCluster Summary – {title}")
+    for cl, members in sorted(cluster_map.items()):
+        if cl == -1:
+            label = "Noise"
+        else:
+            common_label = Counter(members).most_common(1)[0][0]
+            label = label_encoder.classes_[common_label]
+        print(f"  Cluster {cl:>3}: {len(members):>4} samples – Dominant: {label}")
+
+
+# 12. HDBSCAN clustering
+def run_hdbscan_and_plot(embedding, title):
+    hdb = hdbscan.HDBSCAN(min_cluster_size=10, min_samples=5, metric='euclidean')
+    labels = hdb.fit_predict(embedding)
+    
+    # Silhouette Score
+    mask = labels != -1
+    if np.sum(mask) > 1:
+        score = silhouette_score(embedding[mask], labels[mask])
+        print(f"{title} – Silhouette Score: {score:.3f}")
+    else:
+        print(f"{title} – Too few non-noise points for silhouette score.")
+    
+    return labels
+
+# Run HDBSCAN on both
+labels_def_event = run_hdbscan_and_plot(embedding_def_event, "Defining Event UMAP")
+print_cluster_summary(labels_def_event, y_int, def_event_le, "Defining Event")
+hdb_labels_flight = hdbscan.HDBSCAN(min_cluster_size=10, min_samples=5, metric='euclidean').fit_predict(embedding_flight_type)
+print_cluster_summary(hdb_labels_flight, flight_y, flight_le, "Flight Conducted Under")
+
+print(" Plotting HDBSCAN Clusters...")
+plot_hdbscan_with_labels(
+    embedding=embedding_flight_type,
+    hdb_labels=hdb_labels_flight,
+    true_labels=flight_y,
+    label_encoder=flight_le,
+    title="HDBSCAN with Dominant Flight Type Labels",
+    color_map=color_map_flight,
+    df=df
+)
+
+plot_hdbscan_with_labels(
+    embedding=embedding_def_event,
+    hdb_labels=labels_def_event,
+    true_labels=y_int,
+    label_encoder=def_event_le,
+    title="HDBSCAN with Dominant Defining Event Labels",
+    color_map=color_map_event,
+    df=df
+)
+# Run HDBSCAN for Injury UMAP
+labels_injury = run_hdbscan_and_plot(embedding_injury_vector, "Injury UMAP")
+print_cluster_summary(labels_injury, injury_y_vector, injury_le_vector, "Injury Type")
+
+plot_hdbscan_with_labels(
+    embedding=embedding_injury_vector,
+    hdb_labels=labels_injury,
+    true_labels=injury_y_vector,
+    label_encoder=injury_le_vector,
+    title="HDBSCAN with Dominant Injury Labels",
+    color_map=color_map_injury,
+    df=df
+)
+
+# 11. Crosstabs & Keyword Analysis
+ct_event_flight = pd.crosstab(df["Defining Event"], df["Flight Conducted Under"])
+ct_event_injuries = pd.crosstab(df["Defining Event"], df["Injury Label"])
+ct_flight_injuries = pd.crosstab(df["Flight Conducted Under"], df["Injury Label"])
+
+# Defining Event vs Flight Conducted Under 
+plot_topN_heatmap(
+    ct=ct_event_flight,
+    top_n_rows=10,
+    title="Defining Event vs Flight Conducted Under (TopN)"
+)
+
+# Defining Events vs Injuries 
+plot_topN_heatmap(
+    ct=ct_event_injuries,
+    top_n_rows=10,
+    top_n_cols=4,
+    title="Defining Events vs Injuries",
+    col_map=color_map_injury
+)
+
+plot_topN_heatmap(
+    ct_flight_injuries,
+    top_n_rows=5, 
+    top_n_cols=4,     
+    title="Flight Conducted Under vs Injuries",
+    col_map=color_map_injury 
+)
+# Defining Event vs Cluster
+print("\n=== Crosstab: Defining Event vs Cluster ===")
+crosstab_def = pd.crosstab(df_defining_event["Defining Event"], df_defining_event["Cluster"])
+print(crosstab_def)
+# Flight Conducted Under
+crosstab_flight = pd.crosstab(df_flight_conducted["Flight Conducted Under"], df_flight_conducted["Cluster"])
+print("\n=== Crosstab: Flight Conducted Under vs Cluster ===")
+print(crosstab_flight)
+# Injuries
+crosstab_injury = pd.crosstab(df_injuries["Injuries"], df_injuries["Cluster"])
+print("\n=== Crosstab: Injuries vs Cluster ===")
+print(crosstab_injury)
+
+# Check cluster sizes
+helpers.cluster_sizes(df_injuries)
+helpers.cluster_sizes(df_defining_event)
+helpers.cluster_sizes(df_flight_conducted)
+
+# Keyword Analysis for UMAP Graphs
+keywords_defining_umap = helpers.extract_keywords_all_labels(df_defining_event, text_lookup, "Defining Event")
+keywords_flight_umap   = helpers.extract_keywords_all_labels(df_flight_conducted, text_lookup, "Flight Conducted Under")
+keywords_injuries_umap = helpers.extract_keywords_all_labels(df_injuries, text_lookup, "Injuries")
+
+print("\n=== Defining Event UMAP Clusters ===")
+helpers.neat_print_keywords(keywords_defining_umap, title="Defining Event")
+
+print("\n=== Flight Conducted Under UMAP Clusters ===")
+helpers.neat_print_keywords(keywords_flight_umap, title="Flight Conducted Under")
+
+print("\n=== Injuries UMAP Clusters ===")
+helpers.neat_print_keywords(keywords_injuries_umap, title="Injuries")
+
+# Defining Event
+keywords_defining_hdb = helpers.extract_hdbscan_keywords(df_defining_event, text_lookup, cluster_col ="Cluster", filename_col="Filename")
+helpers.neat_print_hdbscan_keywords(keywords_defining_hdb, "Defining Event HDBSCAN")
+# Flight Conducted Under
+keywords_flight_hdb = helpers.extract_hdbscan_keywords(df_flight_conducted, text_lookup, cluster_col ="Cluster", filename_col="Filename")
+helpers.neat_print_hdbscan_keywords(keywords_flight_hdb, "Flight Conducted Under HDBSCAN")
+# Injuries
+keywords_injuries_hdb = helpers.extract_hdbscan_keywords(df_injuries, text_lookup, cluster_col ="Cluster", filename_col="Filename")
+helpers.neat_print_hdbscan_keywords(keywords_injuries_hdb, "Injuries HDBSCAN")
+
+# 12. Similarity Search 
+def find_similar_reports(df, query_file, embedding_col="Embedding", text_col="Filename", top_n=10):
+     # Get query embedding
+    query_embedding = np.array(df.loc[df[text_col] == query_file, embedding_col].tolist())
+    if query_embedding.size == 0:
+        raise ValueError(f"Query file {query_file} not found in dataframe")
+    
+    # Compute similarity
+    embeddings = np.stack(df[embedding_col].to_numpy())
+    similarities = cosine_similarity(query_embedding, embeddings)[0]
+    df = df.copy()
+    df["Similarity"] = similarities
+    
+    # Get top_n (excluding the query itself)
+    similar_df = df[df[text_col] != query_file].nlargest(top_n, "Similarity")
+    return similar_df, df
+
+def plot_similar_on_umap(df, query_file, similar_df, text_col="Filename", label_col=None):
+    """
+    Plots UMAP 3D projection with query, similar, and other reports.
+    """
+    # Create highlight column
+    df = df.copy()
+    df["highlight"] = "Other"
+    df.loc[df[text_col] == query_file, "highlight"] = "Query"
+    df.loc[df[text_col].isin(similar_df[text_col].tolist()), "highlight"] = "Similar"
+
+    # Assign colors
+    color_map = {
+        "Query": "red",
+        "Similar": "orange",
+        "Other": "lightgray"
+    }
+
+    #Define hover fields here
+    hover_fields = {text_col: True}  # always show Filename
+    if label_col and label_col in df.columns:
+        hover_fields[label_col] = True
+
+    fig = px.scatter_3d(
+        df,
+        x="UMAP1", y="UMAP2", z="UMAP3",
+        color="highlight",
+        color_discrete_map=color_map,
+        symbol="highlight",
+        symbol_map={"Query": "diamond", "Similar": "circle", "Other": "circle"},
+        opacity=0.8,
+        title=f"3D UMAP - Similar Reports for {query_file}",
+        hover_data=hover_fields 
+    )
+    fig.show()
+
+# Query file
+query_file = "100526.pdf"
+
+# Defining Event
+similar_defining, df_defining_event = find_similar_reports(df_defining_event, query_file, top_n=10)
+plot_similar_on_umap(df_defining_event, query_file, similar_defining, label_col ="Defining Event")
+
+# Flight Conducted Under
+similar_flight, df_flight_conducted = find_similar_reports(df_flight_conducted, query_file, top_n=10)
+plot_similar_on_umap(df_flight_conducted, query_file, similar_flight, label_col ="Flight Conducted Under")
+
+# Injuries
+similar_injuries, df_injuries = find_similar_reports(df_injuries, query_file, top_n=10)
+plot_similar_on_umap(df_injuries, query_file, similar_injuries, label_col ="Injuries")
+
+# 13. Report Comparisons
+def compare_reports_by_filename(df, vec_array, file1, file2):
+    """
+    Compare two reports using their PDF filenames.
+    Calculates cosine similarity and Euclidean distance.
+    """
+    try:
+        idx1 = df[df['Filename'] == file1].index[0]
+        idx2 = df[df['Filename'] == file2].index[0]
+
+        vec1 = vec_array[idx1].reshape(1, -1)
+        vec2 = vec_array[idx2].reshape(1, -1)
+
+        cosine_sim = cosine_similarity(vec1, vec2)[0][0]
+        euclid_dist = euclidean_distances(vec1, vec2)[0][0]
+
+        print(f"\n Comparing: {file1}  vs  {file2}")
+        print("-" * 50)
+        print(f"Defining Event 1: {df.iloc[idx1]['Defining Event']}")
+        print(f"Defining Event 2: {df.iloc[idx2]['Defining Event']}\n")
+
+        print(f"Injury Label 1: {df.iloc[idx1]['Injury Label']}")
+        print(f"Injury Label 2: {df.iloc[idx2]['Injury Label']}\n")
+
+        print(f"Flight Type 1:  {df.iloc[idx1]['Flight Conducted Under']}")
+        print(f"Flight Type 2:  {df.iloc[idx2]['Flight Conducted Under']}\n")
+
+        print(f"Cosine Similarity:   {cosine_sim:.4f}")
+        print(f"Euclidean Distance:  {euclid_dist:.4f}")
+
+    except IndexError:
+        print(" One or both filenames not found in the DataFrame.")
+
+compare_reports_by_filename(df, vec_array, "100631.pdf", "100636.pdf")
+
+def compare_raw_texts_by_filename(df, meta, filename1, filename2, pdf_files):
+    try:
+        path1 = next(f for f in pdf_files if f.endswith(filename1))
+        path2 = next(f for f in pdf_files if f.endswith(filename2))
+
+        meta1, text1 = extract_sections(path1)
+        meta2, text2 = extract_sections(path2)
+
+        print(f"\n Comparing raw report texts from '{filename1}' and '{filename2}':\n")
+
+        print(f"--- {filename1} ---")
+        print(text1 if text1 else "[No usable text]")
+
+        print("\n" + "-" * 80 + "\n")
+
+        print(f"--- {filename2} ---")
+        print(text2 if text2 else "[No usable text]")
+
+
+    except StopIteration:
+        print(" One or both filenames not found.")
+
+compare_raw_texts_by_filename(df, meta,"100631.pdf", "100636.pdf", pdf_files)
